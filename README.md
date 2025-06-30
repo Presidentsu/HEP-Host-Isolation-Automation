@@ -268,3 +268,4 @@ For issues or questions:
 
 - **v1.0**: Initial release with basic automation
 - **v2.0**: Added comprehensive reporting and logging
+- **v2.1**: Added support for checking of endpoint status if its either isolated or not isolated, if already isolated it will automatically skip the isolation push operation. 
