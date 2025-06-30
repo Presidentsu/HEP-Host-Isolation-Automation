@@ -327,8 +327,101 @@ class HarmonyEndpointAPI:
             logger.error(f"Error checking job status: {e}")
             return {}
     
+    def check_isolation_status(self, computer_ids: List[str]) -> Dict[str, str]:
+        """Check current isolation status of computers"""
+        if not computer_ids:
+            return {}
+            
+        url = f"{self.gateway}/app/endpoint-web-mgmt/harmony/endpoint/api/v1/asset-management/computers/filtered"
+        headers = {
+            "Authorization": f"Bearer {self.ci_token}",
+            "x-mgmt-api-token": self.api_token,
+            "x-mgmt-run-as-job": "on"
+        }
+        
+        payload = {
+            "filters": [
+                {
+                    "columnName": "computerId",
+                    "filterValues": computer_ids,
+                    "filterType": "Exact"
+                }
+            ],
+            "paging": {"pageSize": min(len(computer_ids), 50), "offset": 0}
+        }
+        
+        logger.info(f"Checking isolation status for {len(computer_ids)} computers")
+        
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            logger.info(f"Isolation status check response: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Handle job response
+                if 'jobId' in data:
+                    return self._wait_for_isolation_status_job(data['jobId'], computer_ids)
+                else:
+                    computers = data.get('computers', [])
+                    status_map = {}
+                    for computer in computers:
+                        computer_id = computer.get('computerId')
+                        isolation_status = computer.get('isolationStatus', 'Unknown')
+                        status_map[computer_id] = isolation_status
+                        logger.info(f"Computer {computer_id}: isolation status = {isolation_status}")
+                    
+                    return status_map
+            else:
+                logger.error(f"Failed to check isolation status: {response.text}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error checking isolation status: {e}")
+            return {}
+    
+    def _wait_for_isolation_status_job(self, job_id: str, computer_ids: List[str]) -> Dict[str, str]:
+        """Wait for isolation status check job completion"""
+        job_url = f"{self.gateway}/app/endpoint-web-mgmt/harmony/endpoint/api/v1/jobs/{job_id}"
+        headers = {
+            "Authorization": f"Bearer {self.ci_token}",
+            "x-mgmt-api-token": self.api_token
+        }
+        
+        for attempt in range(30):
+            try:
+                response = requests.get(job_url, headers=headers)
+                if response.status_code == 200:
+                    job_data = response.json()
+                    status = job_data.get('status')
+                    
+                    if status == 'DONE':
+                        computers = job_data.get('data', {}).get('computers', [])
+                        status_map = {}
+                        for computer in computers:
+                            computer_id = computer.get('computerId')
+                            isolation_status = computer.get('isolationStatus', 'Unknown')
+                            status_map[computer_id] = isolation_status
+                            logger.info(f"Computer {computer_id}: isolation status = {isolation_status}")
+                        
+                        return status_map
+                    elif status == 'FAILED':
+                        logger.error("Isolation status check job failed")
+                        return {}
+                    
+                    logger.info("Isolation status check job in progress...")
+                    time.sleep(2)
+                else:
+                    logger.error(f"Failed to check job status: {response.text}")
+                    return {}
+            except Exception as e:
+                logger.error(f"Error checking isolation status job: {e}")
+                return {}
+        
+        logger.error("Isolation status check job timed out")
+        return {}
+    
     def isolate_host(self, hostnames: List[str], comment: str = "Automated isolation due to forensics alert") -> Tuple[bool, str]:
-        """Isolate hosts using hostnames (converts to computer IDs first)"""
+        """Isolate hosts using hostnames (converts to computer IDs first and checks current status)"""
         # First, get computer IDs from hostnames
         computer_ids = []
         failed_lookups = []
@@ -348,7 +441,29 @@ class HarmonyEndpointAPI:
         
         logger.info(f"Found {len(computer_ids)} computer IDs for isolation: {computer_ids}")
         
-        # Proceed with isolation
+        # Check current isolation status to avoid duplicates
+        isolation_statuses = self.check_isolation_status(computer_ids)
+        already_isolated = []
+        non_isolated_ids = []
+        
+        for computer_id in computer_ids:
+            status = isolation_statuses.get(computer_id, 'Unknown').lower()
+            if status in ['isolated', 'restricted']:
+                already_isolated.append(computer_id)
+                logger.info(f"Computer {computer_id} already isolated (status: {status})")
+            else:
+                non_isolated_ids.append(computer_id)
+                logger.info(f"Computer {computer_id} not isolated (status: {status})")
+        
+        if already_isolated:
+            logger.warning(f"Skipping {len(already_isolated)} already isolated machines: {already_isolated}")
+        
+        if not non_isolated_ids:
+            return True, f"All {len(computer_ids)} machines already isolated"
+        
+        logger.info(f"Proceeding to isolate {len(non_isolated_ids)} non-isolated machines: {non_isolated_ids}")
+        
+        # Proceed with isolation for non-isolated machines
         url = f"{self.gateway}/app/endpoint-web-mgmt/harmony/endpoint/api/v1/remediation/isolate"
         headers = {
             "Authorization": f"Bearer {self.ci_token}",
@@ -357,10 +472,10 @@ class HarmonyEndpointAPI:
         }
         
         payload = {
-            "comment": comment,
+            "comment": f"{comment} (Skipped {len(already_isolated)} already isolated)",
             "targets": {
                 "include": {
-                    "computers": [{"id": cid} for cid in computer_ids]
+                    "computers": [{"id": cid} for cid in non_isolated_ids]
                 }
             }
         }
@@ -385,9 +500,11 @@ class HarmonyEndpointAPI:
                     if job_status:
                         logger.info(f"Initial job status: {job_status}")
                     
-                    return True, job_id
+                    summary_msg = f"Job {job_id}: {len(non_isolated_ids)} new isolations, {len(already_isolated)} already isolated"
+                    return True, summary_msg
                 else:
-                    return True, "Isolation initiated successfully"
+                    summary_msg = f"Isolation initiated: {len(non_isolated_ids)} new, {len(already_isolated)} already isolated"
+                    return True, summary_msg
             else:
                 logger.error(f"Isolation failed: {response.text}")
                 return False, response.text
